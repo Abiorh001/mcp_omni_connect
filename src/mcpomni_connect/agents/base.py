@@ -47,6 +47,7 @@ from mcpomni_connect.memory_store.memory_management.memory_manager import (
     fire_and_forget_memory_processing,
     MemoryManagerFactory,
 )
+from mcpomni_connect.tool_retriever import ToolRetriever
 import traceback
 from mcpomni_connect.memory_store.memory_management.shared_embedding import (
     is_vector_db_enabled,
@@ -84,6 +85,10 @@ class BaseReactAgent:
         self.usage_limits = UsageLimits(
             request_limit=self.request_limit, total_tokens_limit=self.total_tokens_limit
         )
+
+        # Initialize tool retriever once for the agent lifetime
+        self.tool_retriever = ToolRetriever()
+        logger.info(f"Initialized ToolRetriever for agent: {self.agent_name}")
 
     async def get_long_episodic_memory(self, query: str, session_id: str):
         """Get long-term and episodic memory for a given query and session ID using optimized single query"""
@@ -671,18 +676,23 @@ class BaseReactAgent:
             self.state = previous_state
 
     async def get_tools_registry(
-        self, mcp_tools: dict = None, local_tools: Any = None
+        self,
+        mcp_tools: dict = None,
+        local_tools: Any = None,
+        query: str = None,
+        top_k: int = 20,
     ) -> str:
         tools_section = []
+
+        # First, index all tools if semantic search is enabled
+        all_tools_md = []
+
         try:
             # Process MCP tools
             if mcp_tools:
                 for server_name, tools in mcp_tools.items():
                     if not tools:
                         continue
-
-                    # Add server header
-                    tools_section.append(f"## {server_name.upper()} TOOLS (MCP)")
 
                     # Handle MCP Tool objects
                     for tool in tools:
@@ -705,14 +715,18 @@ class BaseReactAgent:
                                         param_type = param_info.get("type", "any")
                                         tool_md += f"| `{param_name}` | `{param_type}` | {param_desc} |\n"
 
-                            tools_section.append(tool_md)
+                            # Index the tool for semantic search
+                            self.tool_retriever.upsert_tools(tool_md)
+                            logger.debug(f"Indexed MCP tool: {tool_name}")
+
+                            all_tools_md.append(
+                                {"md": tool_md, "server": server_name, "type": "mcp"}
+                            )
 
             # Process local tools
             if local_tools:
                 local_tools_list = local_tools.get_available_tools()
                 if local_tools_list:
-                    tools_section.append("## LOCAL TOOLS")
-
                     # Handle local tool dictionaries
                     for tool in local_tools_list:
                         if isinstance(tool, dict):
@@ -735,16 +749,94 @@ class BaseReactAgent:
                                         param_type = param_info.get("type", "any")
                                         tool_md += f"| `{param_name}` | `{param_type}` | {param_desc} |\n"
 
-                            tools_section.append(tool_md)
+                            # Index the tool for semantic search
+                            self.tool_retriever.upsert_tools(tool_md)
+                            logger.debug(f"Indexed local tool: {tool_name}")
 
-            if not tools_section:
+                            all_tools_md.append(
+                                {"md": tool_md, "server": "LOCAL", "type": "local"}
+                            )
+
+            if not all_tools_md:
                 return "No tools available"
+
+            # Always use semantic search - our core feature
+            try:
+                relevant_tools = self.tool_retriever.query_tools(
+                    query=query, top_k=top_k, all_tools=all_tools_md
+                )
+
+                # Group tools by server/type
+                tools_by_server = {}
+                for tool_info in relevant_tools:
+                    server = tool_info.get("server", "UNKNOWN")
+                    if server not in tools_by_server:
+                        tools_by_server[server] = []
+                    tools_by_server[server].append(tool_info["md"])
+
+                # Build the tools section with relevant tools only
+                for server, tools in tools_by_server.items():
+                    tools_section.append(f"## {server.upper()} TOOLS")
+                    tools_section.extend(tools)
+
+            except Exception as e:
+                logger.warning(
+                    f"Semantic search failed, falling back to common tools: {e}"
+                )
+                # Fallback: return common tools instead of all tools
+                common_tools = self._get_common_tools(all_tools_md, top_k)
+                tools_by_server = {}
+                for tool_info in common_tools:
+                    server = tool_info.get("server", "UNKNOWN")
+                    if server not in tools_by_server:
+                        tools_by_server[server] = []
+                    tools_by_server[server].append(tool_info["md"])
+
+                for server, tools in tools_by_server.items():
+                    tools_section.append(f"## {server.upper()} TOOLS")
+                    tools_section.extend(tools)
 
         except Exception as e:
             logger.error(f"Error getting tools registry: {e}")
             return "No tools registry available"
 
         return "\n\n".join(tools_section)
+
+    def _get_common_tools(self, all_tools: list, top_k: int) -> list:
+        """Get commonly used tools for general queries"""
+        if not all_tools:
+            return []
+
+        # Prioritize common tool categories
+        common_keywords = [
+            "file",
+            "read",
+            "write",
+            "list",
+            "get",
+            "set",
+            "create",
+            "delete",
+        ]
+        common_tools = []
+
+        for tool in all_tools:
+            tool_md = tool.get("md", "")
+            tool_lower = tool_md.lower()
+
+            # Check if tool contains common keywords
+            if any(keyword in tool_lower for keyword in common_keywords):
+                common_tools.append(tool)
+
+            if len(common_tools) >= top_k:
+                break
+
+        # If not enough common tools, add some others
+        if len(common_tools) < top_k:
+            remaining = [tool for tool in all_tools if tool not in common_tools]
+            common_tools.extend(remaining[: top_k - len(common_tools)])
+
+        return common_tools[:top_k]
 
     async def run(
         self,
@@ -775,8 +867,13 @@ class BaseReactAgent:
             await event_router(session_id=session_id, event=event)
 
         # Initialize messages with system prompt
+        # Semantic search is our core feature - always enabled
+        logger.info(f"Getting tools registry for query: '{query}'")
         tools_section = await self.get_tools_registry(
-            mcp_tools=mcp_tools, local_tools=local_tools
+            mcp_tools=mcp_tools,
+            local_tools=local_tools,
+            query=query,  # Pass the user query for semantic tool search
+            top_k=20,
         )
         long_term_memory, episodic_memory = await self.get_long_episodic_memory(
             query=query, session_id=session_id
@@ -972,7 +1069,7 @@ class BaseReactAgent:
         if self.state == AgentState.STUCK and last_valid_response:
             # Prepend loop detection context for judge evaluation
             loop_context = (
-                f"[SYSTEM_CONTEXT: LOOP_DETECTED - Agent stuck in tool call loop]\n\n"
+                "[SYSTEM_CONTEXT: LOOP_DETECTED - Agent stuck in tool call loop]\n\n"
             )
             return loop_context + last_valid_response
 
